@@ -2,11 +2,8 @@
 //! conversion functions: `atof`, `strtod`, `strtof`, `atoi`, `atol`, `atoll`,
 //! `strtol`, `strtoul`, `strtoll`, and `strtoull`.
 //!
-//! Call site:  `atof(&raw mut buf as *mut c_char)`  ==>  `atof(&buf)`
-//! (and delete the `extern "C" { fn atof(..) }` declaration c2rust emitted).
-//!
 //! Assumptions (both are the C defaults, so they hold unless the program
-//! changed them): LC_NUMERIC is the "C" locale, and the FP rounding mode is
+//! changed them): `LC_NUMERIC` is the "C" locale, and the FP rounding mode is
 //! round-to-nearest-even.
 //!
 //! `CStr::from_bytes_until_nul(..)?.to_str()?.parse::<f64>()` looks close but differs from `atof` in several ways:
@@ -16,7 +13,11 @@
 //!   • NaN payloads: glibc turns `nan(123)` into a NaN carrying payload bits.
 //!   • Failed conversion: `atof` returns +0.0 even after a `-` ("-abc"), while "-0x" gives -0.0.
 //! Decimal input still goes through Rust's parse once the valid prefix has been cut out,
-//! because Rust's parser is correctly rounded, just like glibc's.
+//! because Rust's parser is correctly rounded.
+//!
+//! The behavior of this crate should match glibc, except where the latter is buggy.
+//! See for example [bug 30220](https://sourceware.org/pipermail/glibc-bugs/2024-August/057836.html),
+//! which [affects glibc < 2.39](https://sourceware.org/pipermail/libc-stable/2024-September/002085.html).
 pub fn atof(buf: &[u8]) -> f64 {
     // strtod stops at the NUL. With no NUL in the array the C call is UB;
     // stopping at the end of the array is a valid refinement of that.
@@ -410,13 +411,20 @@ fn strto_u_e<F: BinaryFloat>(s: &[u8], endoff: &mut usize) -> (F, Option<errno::
         }
     }
     // The token is ASCII and matches Rust's float grammar, and Rust's parser is
-    // correctly rounded, like glibc's. Neither unwrap can fail.
+    // correctly rounded. Neither unwrap can fail.
     let tok = core::str::from_utf8(&s[..n]).unwrap();
     *endoff = i + n;
     let value = F::parse_decimal(tok);
+    let normal_boundary_underflow = value.to_bits() == 1u64 << F::FRACTION_BITS
+        && decimal_cmp_binary(
+            tok,
+            (1u64 << (F::FRACTION_BITS + 2)) - 1,
+            F::SUBNORMAL_EXP - 2,
+        ) == core::cmp::Ordering::Less;
     let error = if value.is_infinite()
         || (value.is_zero() && s[..mantissa_end].iter().any(|c| matches!(c, b'1'..=b'9')))
         || (value.is_subnormal() && !decimal_is_exact::<F>(tok, value))
+        || normal_boundary_underflow
     {
         Some(errno::Errno(libc::ERANGE))
     } else {
@@ -506,7 +514,15 @@ fn hex<F: BinaryFloat>(s: &[u8], endoff: &mut usize) -> (F, Option<errno::Errno>
     };
     let value = F::from_bits(base + q); // a carry out of the mantissa bumps the exponent (up to inf)
     let inexact = rem != 0 || sticky;
-    let error = if value.is_infinite() || (value.is_subnormal() || value.is_zero()) && inexact {
+    // glibc reports underflow when rounding a value from below this
+    // threshold into the smallest normal number.
+    let normal_boundary_underflow = e < F::MIN_NORMAL_EXP
+        && value.to_bits() == 1u64 << F::FRACTION_BITS
+        && rem < half + (half >> 1);
+    let error = if value.is_infinite()
+        || ((value.is_subnormal() || value.is_zero()) && inexact)
+        || normal_boundary_underflow
+    {
         Some(errno::Errno(libc::ERANGE))
     } else {
         None
@@ -517,6 +533,15 @@ fn hex<F: BinaryFloat>(s: &[u8], endoff: &mut usize) -> (F, Option<errno::Errno>
 /// Compare a decimal token with the full decimal expansion of a subnormal.
 /// Exact subnormals do not cause a range error.
 fn decimal_is_exact<F: BinaryFloat>(tok: &str, value: F) -> bool {
+    decimal_cmp_binary(
+        tok,
+        value.to_bits() & ((1u64 << F::FRACTION_BITS) - 1),
+        F::SUBNORMAL_EXP,
+    ) == core::cmp::Ordering::Equal
+}
+
+/// Compare a positive decimal token to `numerator * 2^binary_exp` exactly.
+fn decimal_cmp_binary(tok: &str, numerator: u64, binary_exp: i64) -> core::cmp::Ordering {
     let (mantissa, exponent) = match tok.find(['e', 'E']) {
         Some(i) => {
             let exponent = &tok[i + 1..];
@@ -546,14 +571,13 @@ fn decimal_is_exact<F: BinaryFloat>(tok: &str, value: F) -> bool {
         scale = scale.saturating_add(1);
     }
 
-    // A subnormal is q * 2^SUBNORMAL_EXP, with an exact decimal expansion.
-    let mut exact: Vec<u8> = (value.to_bits() & ((1u64 << F::FRACTION_BITS) - 1))
+    let mut exact: Vec<u8> = numerator
         .to_string()
         .bytes()
         .rev()
         .map(|c| c - b'0')
         .collect();
-    for _ in 0..(-F::SUBNORMAL_EXP) {
+    for _ in 0..(-binary_exp) {
         let mut carry = 0;
         for digit in &mut exact {
             let product = *digit * 5 + carry;
@@ -564,12 +588,30 @@ fn decimal_is_exact<F: BinaryFloat>(tok: &str, value: F) -> bool {
             exact.push(carry);
         }
     }
-    let mut exact_scale = F::SUBNORMAL_EXP as i128;
+    let mut exact_scale = binary_exp as i128;
     while exact.first() == Some(&0) {
         exact.remove(0);
         exact_scale += 1;
     }
-    digits.iter().rev().map(|c| c - b'0').eq(exact) && scale == exact_scale
+    let decimal_order = scale.saturating_add(digits.len() as i128);
+    let binary_order = exact_scale.saturating_add(exact.len() as i128);
+    match decimal_order.cmp(&binary_order) {
+        core::cmp::Ordering::Equal => {
+            for i in 0..digits.len().max(exact.len()) {
+                let decimal_digit = digits.get(i).map_or(0, |c| c - b'0');
+                let binary_digit = exact
+                    .len()
+                    .checked_sub(i + 1)
+                    .map_or(0, |index| exact[index]);
+                match decimal_digit.cmp(&binary_digit) {
+                    core::cmp::Ordering::Equal => {}
+                    result => return result,
+                }
+            }
+            core::cmp::Ordering::Equal
+        }
+        result => result,
+    }
 }
 
 /// glibc NaN, including its "nan(n-char-sequence)" payload extension.
@@ -659,21 +701,23 @@ mod tests {
 
     #[test]
     fn endoff_for_infinity_and_nan() {
-        for (input, end) in [
-            ("INF!", 3),
-            (" -InFiNiTy!", 10),
-            ("infinite", 3),
-            ("nan", 3),
-            (" nan(123)tail", 9),
-            ("nan(foo)tail", 8),
-            ("nan()tail", 5),
-            ("nan(abc", 3),
-            ("nan(12-x)", 3),
+        for (input, bits, end) in [
+            ("INF!", f64::INFINITY.to_bits(), 3),
+            (" -InFiNiTy!", f64::NEG_INFINITY.to_bits(), 10),
+            ("infinite", f64::INFINITY.to_bits(), 3),
+            ("nan", 0x7ff8_0000_0000_0000, 3),
+            (" nan(123)tail", 0x7ff8_0000_0000_007b, 9),
+            ("-nan(123)", 0xfff8_0000_0000_007b, 9),
+            ("nan(foo)tail", 0x7ff8_0000_0000_0000, 8),
+            ("nan()tail", 0x7ff8_0000_0000_0000, 5),
+            ("nan(abc", 0x7ff8_0000_0000_0000, 3),
+            ("nan(12-x)", 0x7ff8_0000_0000_0000, 3),
         ] {
             let mut endoff = usize::MAX;
-            let (value, _) = strtod_u_e(input.as_bytes(), &mut endoff);
+            let (value, error) = strtod_u_e(input.as_bytes(), &mut endoff);
             assert_eq!(endoff, end, "{input:?}");
-            assert!(value.is_infinite() || value.is_nan(), "{input:?}");
+            assert_eq!(value.to_bits(), bits, "{input:?}");
+            assert_eq!(error, None, "{input:?}");
         }
     }
 
@@ -713,6 +757,11 @@ mod tests {
         let (value, error) = strtod_u_e(exact_subnormal.as_bytes(), &mut endoff);
         assert_eq!(value.to_bits(), 1);
         assert_eq!(endoff, exact_subnormal.len());
+        assert_eq!(error, None);
+        let exact_with_exponent = format!("{exact_subnormal}0e0");
+        let (value, error) = strtod_u_e(exact_with_exponent.as_bytes(), &mut endoff);
+        assert_eq!(value.to_bits(), 1);
+        assert_eq!(endoff, exact_with_exponent.len());
         assert_eq!(error, None);
         errno::set_errno(old);
     }
@@ -806,6 +855,11 @@ mod tests {
         assert_eq!(value.to_bits(), 1);
         assert_eq!(error, None);
         assert_eq!(endoff, exact_subnormal.len());
+        let exact_with_exponent = format!("{exact_subnormal}0e0");
+        let (value, error) = strtof_u_e(exact_with_exponent.as_bytes(), &mut endoff);
+        assert_eq!(value.to_bits(), 1);
+        assert_eq!(error, None);
+        assert_eq!(endoff, exact_with_exponent.len());
 
         assert!(strtof_n(b"1e39").is_infinite());
         assert_eq!(errno::errno(), errno::Errno(libc::ERANGE));
@@ -813,6 +867,157 @@ mod tests {
         assert_eq!(strtof_n(b"1.5"), 1.5);
         assert_eq!(errno::errno(), errno::Errno(libc::EINVAL));
         errno::set_errno(old);
+    }
+
+    #[test]
+    fn strtod_rounding_boundaries() {
+        // Nearest-even bits; errno cases checked against glibc in the C locale.
+        for (input, bits, range_error) in [
+            // Decimal halfway values round to the result with an even low bit.
+            (
+                "1.00000000000000011102230246251565404236316680908203125",
+                0x3ff0_0000_0000_0000,
+                false,
+            ),
+            (
+                "1.00000000000000033306690738754696212708950042724609375",
+                0x3ff0_0000_0000_0002,
+                false,
+            ),
+            (
+                "1.000000000000000111022302462515654042363166809082031250000001",
+                0x3ff0_0000_0000_0001,
+                false,
+            ),
+            // A historical glibc halfway-rounding regression (libc/3479).
+            ("3.518437208883201171875E+013", 0x42c0_0000_0000_0002, false),
+            ("3.518437208883201171999E+013", 0x42c0_0000_0000_0002, false),
+            ("1.7976931348623157e308", 0x7fef_ffff_ffff_ffff, false),
+            ("1.7976931348623159e308", 0x7ff0_0000_0000_0000, true),
+            ("1e-324", 0x0, true),
+            ("5e-324", 0x1, true),
+            ("2.2250738585072011e-308", 0x000f_ffff_ffff_ffff, true),
+            ("2.2250738585072012e-308", 0x0010_0000_0000_0000, true),
+            ("2.2250738585072013e-308", 0x0010_0000_0000_0000, false),
+            ("2.2250738585072014e-308", 0x0010_0000_0000_0000, false),
+            // Hex ties, including a discarded nonzero digit beyond the kept mantissa.
+            ("0x1.00000000000008p0", 0x3ff0_0000_0000_0000, false),
+            ("0x1.00000000000018p0", 0x3ff0_0000_0000_0002, false),
+            (
+                "0x1.0000000000000800000000000001p0",
+                0x3ff0_0000_0000_0001,
+                false,
+            ),
+            ("0x1.fffffffffffffp1023", 0x7fef_ffff_ffff_ffff, false),
+            ("0x1.fffffffffffff8p1023", 0x7ff0_0000_0000_0000, true),
+            // Exact and inexact subnormals, and the tie into the normal range.
+            ("0x1p-1074", 0x1, false),
+            ("0x1p-1075", 0x0, true),
+            ("0x1.00000000000008p-1075", 0x1, true),
+            ("0x1.0000000000001p-1075", 0x1, true),
+            ("0x3p-1075", 0x2, true),
+            ("0x1.ffffffffffffep-1023", 0x000f_ffff_ffff_ffff, false),
+            ("0x1.fffffffffffffp-1023", 0x0010_0000_0000_0000, true),
+            ("0x1.fffffffffffff8p-1023", 0x0010_0000_0000_0000, false),
+        ] {
+            let mut endoff = usize::MAX;
+            let (value, error) = strtod_u_e(input.as_bytes(), &mut endoff);
+            assert_eq!(endoff, input.len(), "{input}");
+            assert_eq!(value.to_bits(), bits, "{input}");
+            assert_eq!(
+                error,
+                range_error.then_some(errno::Errno(libc::ERANGE)),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strtof_rounding_boundaries() {
+        // Nearest-even bits; errno cases checked against glibc in the C locale.
+        for (input, bits, range_error) in [
+            ("1.000000059604644775390625", 0x3f80_0000, false),
+            ("1.000000178813934326171875", 0x3f80_0002, false),
+            ("1.0000000596046447753906250000001", 0x3f80_0001, false),
+            ("3.4028235e38", 0x7f7f_ffff, false),
+            ("3.4028236e38", 0x7f80_0000, true),
+            ("1e-46", 0x0, true),
+            ("1e-45", 0x1, true),
+            ("1.17549428e-38", 0x007f_ffff, true),
+            ("1.17549430e-38", 0x0080_0000, true),
+            ("1.17549435e-38", 0x0080_0000, false),
+            ("0x1.000001p0", 0x3f80_0000, false),
+            ("0x1.000003p0", 0x3f80_0002, false),
+            ("0x1.000001000001p0", 0x3f80_0001, false),
+            ("0x1.fffffep127", 0x7f7f_ffff, false),
+            ("0x1.ffffffp127", 0x7f80_0000, true),
+            ("0x1p-149", 0x1, false),
+            ("0x1p-150", 0x0, true),
+            ("0x1.000001p-150", 0x1, true),
+            ("0x1.000002p-150", 0x1, true),
+            ("0x3p-150", 0x2, true),
+            ("0x1.fffffcp-127", 0x007f_ffff, false),
+            ("0x1.fffffep-127", 0x0080_0000, true),
+            ("0x1.ffffffp-127", 0x0080_0000, false),
+        ] {
+            let mut endoff = usize::MAX;
+            let (value, error) = strtof_u_e(input.as_bytes(), &mut endoff);
+            assert_eq!(endoff, input.len(), "{input}");
+            assert_eq!(value.to_bits(), bits, "{input}");
+            assert_eq!(
+                error,
+                range_error.then_some(errno::Errno(libc::ERANGE)),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_exponents_consume_the_full_token() {
+        for (input, expect_infinity, range_error) in [
+            ("1e99999999999999999999999999", true, true),
+            ("1e-99999999999999999999999999", false, true),
+            ("0e-99999999999999999999999999", false, false),
+            ("0x1p99999999999999999999999999", true, true),
+            ("0x1p-99999999999999999999999999", false, true),
+            ("0x0p-99999999999999999999999999", false, false),
+        ] {
+            let mut endoff = usize::MAX;
+            let (double, double_error) = strtod_u_e(input.as_bytes(), &mut endoff);
+            assert_eq!(endoff, input.len(), "{input}");
+            assert_eq!(
+                double.to_bits(),
+                if expect_infinity {
+                    f64::INFINITY.to_bits()
+                } else {
+                    0
+                },
+                "{input}"
+            );
+            assert_eq!(
+                double_error,
+                range_error.then_some(errno::Errno(libc::ERANGE)),
+                "{input}"
+            );
+
+            endoff = usize::MAX;
+            let (single, single_error) = strtof_u_e(input.as_bytes(), &mut endoff);
+            assert_eq!(endoff, input.len(), "{input}");
+            assert_eq!(
+                single.to_bits(),
+                if expect_infinity {
+                    f32::INFINITY.to_bits()
+                } else {
+                    0
+                },
+                "{input}"
+            );
+            assert_eq!(
+                single_error,
+                range_error.then_some(errno::Errno(libc::ERANGE)),
+                "{input}"
+            );
+        }
     }
 
     #[test]
@@ -904,6 +1109,23 @@ mod tests {
             strtoull_u_e(b"-1", &mut endoff, 10),
             (libc::c_ulonglong::MAX, None)
         );
+
+        let longlong_overflow = format!("{}tail", libc::c_longlong::MAX as u128 + 1);
+        let (value, error) = strtoll_u_e(longlong_overflow.as_bytes(), &mut endoff, 10);
+        assert_eq!(value, libc::c_longlong::MAX);
+        assert_eq!(error, Some(errno::Errno(libc::ERANGE)));
+        assert_eq!(endoff, longlong_overflow.len() - 4);
+
+        let ulonglong_max_hex = format!("0x{:x}!", libc::c_ulonglong::MAX);
+        let (value, error) = strtoull_u_e(ulonglong_max_hex.as_bytes(), &mut endoff, 0);
+        assert_eq!(value, libc::c_ulonglong::MAX);
+        assert_eq!(error, None);
+        assert_eq!(endoff, ulonglong_max_hex.len() - 1);
+        let ulonglong_overflow = format!("{}0!", libc::c_ulonglong::MAX);
+        let (value, error) = strtoull_u_e(ulonglong_overflow.as_bytes(), &mut endoff, 10);
+        assert_eq!(value, libc::c_ulonglong::MAX);
+        assert_eq!(error, Some(errno::Errno(libc::ERANGE)));
+        assert_eq!(endoff, ulonglong_overflow.len() - 1);
     }
 
     #[test]
