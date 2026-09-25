@@ -2,6 +2,9 @@
 name = "xj_atone"
 version = "0.1.0"
 edition = "2024"
+description = "Safe implementations of core C numeric parsing APIs"
+license = "MIT"
+repository = "https://github.com/brk/xj_atone"
 
 [dependencies]
 errno = "0.3.14"
