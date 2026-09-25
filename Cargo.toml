@@ -1,0 +1,8 @@
+[package]
+name = "xj_atone"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+errno = "0.3.14"
+libc = "0.2"
