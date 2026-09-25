@@ -17,7 +17,7 @@
 //!
 //! The behavior of this crate should match glibc, except where the latter is buggy.
 //! See for example [bug 30220](https://sourceware.org/pipermail/glibc-bugs/2024-August/057836.html),
-//! which [affects glibc < 2.39](https://sourceware.org/pipermail/libc-stable/2024-September/002085.html).
+//! which was [fixed on glibc's 2.39 stable branch after release](https://sourceware.org/pipermail/libc-stable/2024-September/002085.html).
 pub fn atof(buf: &[u8]) -> f64 {
     // strtod stops at the NUL. With no NUL in the array the C call is UB;
     // stopping at the end of the array is a valid refinement of that.
@@ -919,6 +919,10 @@ mod tests {
             ("0x1.ffffffffffffep-1023", 0x000f_ffff_ffff_ffff, false),
             ("0x1.fffffffffffffp-1023", 0x0010_0000_0000_0000, true),
             ("0x1.fffffffffffff8p-1023", 0x0010_0000_0000_0000, false),
+            // glibc bug 30220: exact halfway and just-above-halfway inputs.
+            ("0x0.7fffffffffffe8p-1022", 0x0007_ffff_ffff_fffe, true),
+            ("0x0.7fffffffffffe9p-1022", 0x0007_ffff_ffff_ffff, true),
+            ("0x0.7fffffffffffeap-1022", 0x0007_ffff_ffff_ffff, true),
         ] {
             let mut endoff = usize::MAX;
             let (value, error) = strtod_u_e(input.as_bytes(), &mut endoff);
@@ -959,6 +963,8 @@ mod tests {
             ("0x1.fffffcp-127", 0x007f_ffff, false),
             ("0x1.fffffep-127", 0x0080_0000, true),
             ("0x1.ffffffp-127", 0x0080_0000, false),
+            ("0x0.7ffffd0p-126", 0x003f_fffe, true),
+            ("0x0.7ffffd4p-126", 0x003f_ffff, true),
         ] {
             let mut endoff = usize::MAX;
             let (value, error) = strtof_u_e(input.as_bytes(), &mut endoff);
