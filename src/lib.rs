@@ -1,4 +1,4 @@
-//! Safe byte-slice replacements for glibc's floating-point and integer
+//! Safe borrowed-byte replacements for glibc's floating-point and integer
 //! conversion functions: `atof`, `strtod`, `strtof`, `atoi`, `atol`, `atoll`,
 //! `strtol`, `strtoul`, `strtoll`, and `strtoull`.
 //!
@@ -18,16 +18,20 @@
 //! The behavior of this crate should match glibc, except where the latter is buggy.
 //! See for example [bug 30220](https://sourceware.org/pipermail/glibc-bugs/2024-August/057836.html),
 //! which was [fixed on glibc's 2.39 stable branch after release](https://sourceware.org/pipermail/libc-stable/2024-September/002085.html).
-pub fn atof(buf: &[u8]) -> f64 {
-    // strtod stops at the NUL. With no NUL in the array the C call is UB;
-    // stopping at the end of the array is a valid refinement of that.
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+//!
+//! Inputs accept [`ByteView`], including `str`, `CStr`, and byte slices. Parsing
+//! stops at the first NUL or view end; end offsets count bytes.
+
+/// Shared borrowed byte inputs.
+pub use xj_bytes::ByteView;
+
+pub fn atof<B: ByteView + ?Sized>(buf: &B) -> f64 {
     let mut endoff = 0;
-    strtod_u_e(&buf[..end], &mut endoff).0
+    strtod_u_e(buf, &mut endoff).0
 }
 
 /// Parse without an end offset, setting thread-local errno on a range error.
-pub fn strtod_n(s: &[u8]) -> f64 {
+pub fn strtod_n<B: ByteView + ?Sized>(s: &B) -> f64 {
     let mut endoff: usize = 0;
     let (value, error) = strtod_u_e(s, &mut endoff);
     if let Some(error) = error {
@@ -37,7 +41,7 @@ pub fn strtod_n(s: &[u8]) -> f64 {
 }
 
 /// Parse without an end offset, setting thread-local errno on a range error.
-pub fn strtof_n(s: &[u8]) -> f32 {
+pub fn strtof_n<B: ByteView + ?Sized>(s: &B) -> f32 {
     let mut endoff = 0;
     let (value, error) = strtof_u_e(s, &mut endoff);
     if let Some(error) = error {
@@ -49,81 +53,83 @@ pub fn strtof_n(s: &[u8]) -> f32 {
 /// Parse the longest valid `strtod` prefix and set `endoff` to its byte length.
 /// If no conversion is possible, set `endoff` to zero. Return any range error
 /// without changing the thread-local errno.
-pub fn strtod_u_e(s: &[u8], endoff: &mut usize) -> (f64, Option<errno::Errno>) {
+pub fn strtod_u_e<B: ByteView + ?Sized>(s: &B, endoff: &mut usize) -> (f64, Option<errno::Errno>) {
+    let s = xj_bytes::c_bytes(s.view_bytes());
     strto_u_e::<f64>(s, endoff)
 }
 
 /// The `strtof` counterpart of `strtod_u_e`.
-pub fn strtof_u_e(s: &[u8], endoff: &mut usize) -> (f32, Option<errno::Errno>) {
+pub fn strtof_u_e<B: ByteView + ?Sized>(s: &B, endoff: &mut usize) -> (f32, Option<errno::Errno>) {
+    let s = xj_bytes::c_bytes(s.view_bytes());
     strto_u_e::<f32>(s, endoff)
 }
 
 /// Parse a decimal C integer, discarding range errors like `atof`.
-pub fn atoi(buf: &[u8]) -> libc::c_int {
+pub fn atoi<B: ByteView + ?Sized>(buf: &B) -> libc::c_int {
     let mut endoff = 0;
     strtol_u_e(buf, &mut endoff, 10).0 as libc::c_int
 }
 
 /// Parse a decimal C long, discarding range errors like `atof`.
-pub fn atol(buf: &[u8]) -> libc::c_long {
+pub fn atol<B: ByteView + ?Sized>(buf: &B) -> libc::c_long {
     let mut endoff = 0;
     strtol_u_e(buf, &mut endoff, 10).0
 }
 
 /// Parse a decimal C long long, discarding range errors like `atof`.
-pub fn atoll(buf: &[u8]) -> libc::c_longlong {
+pub fn atoll<B: ByteView + ?Sized>(buf: &B) -> libc::c_longlong {
     let mut endoff = 0;
     strtoll_u_e(buf, &mut endoff, 10).0
 }
 
 /// Parse a C long, recording the end offset and setting errno on error.
-pub fn strtol(s: &[u8], endoff: &mut usize, base: i32) -> libc::c_long {
+pub fn strtol<B: ByteView + ?Sized>(s: &B, endoff: &mut usize, base: i32) -> libc::c_long {
     let (value, error) = strtol_u_e(s, endoff, base);
     set_integer_errno(error);
     value
 }
 
 /// Parse a C unsigned long, recording the end offset and setting errno on error.
-pub fn strtoul(s: &[u8], endoff: &mut usize, base: i32) -> libc::c_ulong {
+pub fn strtoul<B: ByteView + ?Sized>(s: &B, endoff: &mut usize, base: i32) -> libc::c_ulong {
     let (value, error) = strtoul_u_e(s, endoff, base);
     set_integer_errno(error);
     value
 }
 
 /// Parse a C long long, recording the end offset and setting errno on error.
-pub fn strtoll(s: &[u8], endoff: &mut usize, base: i32) -> libc::c_longlong {
+pub fn strtoll<B: ByteView + ?Sized>(s: &B, endoff: &mut usize, base: i32) -> libc::c_longlong {
     let (value, error) = strtoll_u_e(s, endoff, base);
     set_integer_errno(error);
     value
 }
 
 /// Parse a C unsigned long long, recording the end offset and setting errno on error.
-pub fn strtoull(s: &[u8], endoff: &mut usize, base: i32) -> libc::c_ulonglong {
+pub fn strtoull<B: ByteView + ?Sized>(s: &B, endoff: &mut usize, base: i32) -> libc::c_ulonglong {
     let (value, error) = strtoull_u_e(s, endoff, base);
     set_integer_errno(error);
     value
 }
 
 /// Parse a C long without an end offset, setting errno on error.
-pub fn strtol_n(s: &[u8], base: i32) -> libc::c_long {
+pub fn strtol_n<B: ByteView + ?Sized>(s: &B, base: i32) -> libc::c_long {
     let mut endoff = 0;
     strtol(s, &mut endoff, base)
 }
 
 /// Parse a C unsigned long without an end offset, setting errno on error.
-pub fn strtoul_n(s: &[u8], base: i32) -> libc::c_ulong {
+pub fn strtoul_n<B: ByteView + ?Sized>(s: &B, base: i32) -> libc::c_ulong {
     let mut endoff = 0;
     strtoul(s, &mut endoff, base)
 }
 
 /// Parse a C long long without an end offset, setting errno on error.
-pub fn strtoll_n(s: &[u8], base: i32) -> libc::c_longlong {
+pub fn strtoll_n<B: ByteView + ?Sized>(s: &B, base: i32) -> libc::c_longlong {
     let mut endoff = 0;
     strtoll(s, &mut endoff, base)
 }
 
 /// Parse a C unsigned long long without an end offset, setting errno on error.
-pub fn strtoull_n(s: &[u8], base: i32) -> libc::c_ulonglong {
+pub fn strtoull_n<B: ByteView + ?Sized>(s: &B, base: i32) -> libc::c_ulonglong {
     let mut endoff = 0;
     strtoull(s, &mut endoff, base)
 }
@@ -131,37 +137,45 @@ pub fn strtoull_n(s: &[u8], base: i32) -> libc::c_ulonglong {
 /// Parse a C long and return any error without changing thread-local errno.
 /// Base 0 detects octal and hexadecimal prefixes; other valid bases are 2..=36.
 /// An invalid base returns zero and `EINVAL`, with `endoff` set to zero.
-pub fn strtol_u_e(s: &[u8], endoff: &mut usize, base: i32) -> (libc::c_long, Option<errno::Errno>) {
+pub fn strtol_u_e<B: ByteView + ?Sized>(
+    s: &B,
+    endoff: &mut usize,
+    base: i32,
+) -> (libc::c_long, Option<errno::Errno>) {
+    let s = xj_bytes::c_bytes(s.view_bytes());
     let (bits, error) = parse_integer(s, endoff, base, libc::c_long::BITS, true);
     (bits as libc::c_long, error)
 }
 
 /// Parse a C unsigned long and return any error without changing thread-local errno.
-pub fn strtoul_u_e(
-    s: &[u8],
+pub fn strtoul_u_e<B: ByteView + ?Sized>(
+    s: &B,
     endoff: &mut usize,
     base: i32,
 ) -> (libc::c_ulong, Option<errno::Errno>) {
+    let s = xj_bytes::c_bytes(s.view_bytes());
     let (bits, error) = parse_integer(s, endoff, base, libc::c_ulong::BITS, false);
     (bits as libc::c_ulong, error)
 }
 
 /// Parse a C long long and return any error without changing thread-local errno.
-pub fn strtoll_u_e(
-    s: &[u8],
+pub fn strtoll_u_e<B: ByteView + ?Sized>(
+    s: &B,
     endoff: &mut usize,
     base: i32,
 ) -> (libc::c_longlong, Option<errno::Errno>) {
+    let s = xj_bytes::c_bytes(s.view_bytes());
     let (bits, error) = parse_integer(s, endoff, base, libc::c_longlong::BITS, true);
     (bits as libc::c_longlong, error)
 }
 
 /// Parse a C unsigned long long and return any error without changing thread-local errno.
-pub fn strtoull_u_e(
-    s: &[u8],
+pub fn strtoull_u_e<B: ByteView + ?Sized>(
+    s: &B,
     endoff: &mut usize,
     base: i32,
 ) -> (libc::c_ulonglong, Option<errno::Errno>) {
+    let s = xj_bytes::c_bytes(s.view_bytes());
     let (bits, error) = parse_integer(s, endoff, base, libc::c_ulonglong::BITS, false);
     (bits as libc::c_ulonglong, error)
 }

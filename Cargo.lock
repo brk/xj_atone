@@ -39,4 +39,9 @@ version = "0.1.0"
 dependencies = [
  "errno",
  "libc",
+ "xj_bytes",
 ]
+
+[[package]]
+name = "xj_bytes"
+version = "0.1.0"
