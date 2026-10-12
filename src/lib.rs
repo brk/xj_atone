@@ -21,6 +21,11 @@
 //!
 //! Inputs accept [`ByteView`], including `str`, `CStr`, and byte slices. Parsing
 //! stops at the first NUL or view end; end offsets count bytes.
+//! The unsafe `strto*_ptr` variants write C-style end pointers into the original
+//! view, without allocating or appending a terminator.
+
+mod ptr;
+pub use ptr::{strtod_ptr, strtof_ptr, strtol_ptr, strtoll_ptr, strtoul_ptr, strtoull_ptr};
 
 /// Shared borrowed byte inputs.
 pub use xj_bytes::ByteView;
